@@ -62,6 +62,8 @@ JAW_RELEASE = 0.4         # per-frame catch-up when closing (lower = lazier clos
 JAW_LEAD = 0.06           # seconds the mouth moves ahead of the sound, as real mouths do
 SIBILANCE_DAMP = 0.7      # 0-1: how much s/sh/f/t sounds keep the mouth nearly closed
 JAW_STEPS = 0             # 0 = continuous; 2 or 3 = snap to fixed positions (servo look)
+ACCENT_HEAD = 4.0         # px the head dips on an accent marked "head": true
+ACCENT_MAX = 1.35         # how far past a normal full open an accent may push
 UPPER_JAW_OPEN = 0.1      # fraction of upper_jaw.up at full open (0 = upper jaw never moves)
 
 # --- head ---
@@ -135,6 +137,19 @@ DUST_COLOR = (255, 240, 215)
 # Resting pose used for the first/last frames and for silence. Channels not listed rest at 0
 # (the PSD as drawn). Remove the jaw entry to rest on the PSD's slightly open mouth.
 REST_POSE = {"lower_jaw.y": 0}   # mouth closed; set to the value you checked on the tower
+
+# Named poses: channel values that differ from REST_POSE. "rest" is the pose every
+# speaking clip starts and ends on; "hunch" is the powered-down attract pose.
+# Positive y is down; hand signs follow HAND_LIFT_SIGN (a lift is the sign shown
+# there, so a drop is the opposite) - flip them here if a hand goes the wrong way.
+POSES = {
+    "rest": {},
+    "hunch": {"head.y": 38, "body.y": 30, "hand_l.r": 10, "hand_r.r": -10,
+              "blink_l.on": 1, "blink_r.on": 1},
+}
+WAKE_ROLL_TURN = 8.0      # degrees the head sweeps each way while "rolling its joints"
+WAKE_ROLL_HAND = 14.0     # degrees each hand rolls out and back
+WAKE_ROLL_SWAY = 10.0     # px the body shifts side to side during the roll
 
 
 def clamp(part, axis, v):
@@ -211,6 +226,42 @@ def audio_features(path):
     target[vol < GATE] = 0
     vol[vol < GATE] = 0
     return vol, np.clip(target, 0, 1)
+
+
+def apply_accents(o, accents):
+    """Punch up particular syllables. Each accent multiplies the jaw's own opening
+    over a short window, so it stays in time with the voice and simply lands
+    harder; "floor" lifts a syllable that barely opened at all.
+
+      [{"t": 4.20, "amount": 0.8},
+       {"t": 7.85, "amount": 0.5, "dur": 0.2, "floor": 0.6, "head": true},
+       {"t": 9.10, "hold": 0.25}]
+
+    Times are the ones --report prints. amount 0 to ~1.5 scales what is already
+    there; floor lifts a syllable that barely opened; hold keeps the jaw near its
+    peak a moment longer, which is what reads as emphasis once a syllable is
+    already opening as far as the jaw can go."""
+    for a in accents:
+        t0 = float(a["t"] if isinstance(a, dict) else a)
+        spec = a if isinstance(a, dict) else {}
+        dur = float(spec.get("dur", 0.3))
+        # amount defaults to a punch only when no other lever was asked for
+        gain = float(spec.get("amount", 0.0 if ("hold" in spec or "floor" in spec) else 0.8))
+        floor = float(spec.get("floor", 0.0))
+        i0 = max(0, int(round((t0 - dur / 2) * FPS)))
+        i1 = min(len(o), int(round((t0 + dur / 2) * FPS)))
+        if i1 <= i0:
+            continue
+        w = np.sin(np.linspace(0, math.pi, i1 - i0)) ** 2      # smooth in and out
+        o[i0:i1] = np.maximum(o[i0:i1] * (1 + gain * w), floor * w)
+        hold = float(spec.get("hold", 0.0))
+        if hold > 0:
+            peak = float(o[i0:i1].max())
+            h0, h1 = i1, min(len(o), i1 + int(round(hold * FPS)))
+            if h1 > h0:
+                decay = np.linspace(1.0, 0.55, h1 - h0)        # eases off, doesn't cut
+                o[h0:h1] = np.maximum(o[h0:h1], peak * decay)
+    return np.clip(o, 0.0, ACCENT_MAX)
 
 
 def jaw_follow(target):
@@ -304,18 +355,105 @@ def _add_gestures(t, vol, n_active, rng):
             t[f"{h}.r"][act] += tr * fade
 
 
-def build_tracks(n_active, vol, open_target, cues, rng):
+def pose_values(name):
+    """Every channel's value in a named pose."""
+    if name not in POSES:
+        sys.exit(f"unknown pose '{name}'; known: {', '.join(POSES)}")
+    vals = {f"{k}.{a}": float(REST_POSE.get(f"{k}.{a}", 0)) for k, a in channels()}
+    for key, v in POSES[name].items():
+        if key in vals:
+            vals[key] = float(v)
+    return vals
+
+
+def build_pose_tracks(name, secs):
+    """A frozen clip: every frame is exactly the pose."""
+    n = max(2 * REST + 1, int(round(secs * FPS)))
+    vals = pose_values(name)
+    t = {}
+    for key, v in vals.items():
+        part, axis = key.split(".")
+        t[key] = np.full(n, float(clamp(part, axis, v)))
+    return t, n
+
+
+def _span(u, a, b):
+    """0 before a, 1 after b, linear between: a local timeline inside a clip."""
+    return np.clip((u - a) / max(b - a, 1e-6), 0.0, 1.0)
+
+
+def build_transition(start, end, secs, style, rng):
+    """A clip that begins exactly on pose `start` and ends exactly on pose `end`.
+    wake:  straightens with a little overshoot, opens its eyes, then slowly rolls
+           the head and hands like a machine testing its joints.
+    sleep: slows, droops and settles, eyes closing near the end."""
+    n = max(4 * REST, int(round(secs * FPS)))
+    a, b = pose_values(start), pose_values(end)
+    m = n - 2 * REST
+    u = np.linspace(0.0, 1.0, m)
+    t = {}
+    for key in a:
+        part, axis = key.split(".")
+        va, vb = a[key], b[key]
+        if axis == "on":                                   # eyelids: a clean switch
+            flip = 0.12 if style == "wake" else 0.78
+            core = np.where(u < flip, va, vb)
+        else:
+            if style == "wake":
+                win = {"body": (0.00, 0.40), "head": (0.08, 0.50)}.get(part, (0.15, 0.55))
+                core = va + (vb - va) * ease(_span(u, *win), "overshoot")
+            else:
+                win = {"head": (0.10, 0.80), "body": (0.20, 0.85)}.get(part, (0.30, 0.90))
+                core = va + (vb - va) * ease(_span(u, *win), "inout")
+        t[key] = np.concatenate([np.full(REST, va), core, np.full(REST, vb)])
+
+    if style == "wake":
+        # the joint roll: an envelope that is zero at both edges, over the back half
+        env = np.sin(math.pi * _span(u, 0.50, 0.97)) ** 2
+        roll = _span(u, 0.50, 0.97)
+        pad = lambda x: np.concatenate([np.zeros(REST), x, np.zeros(REST)])
+        t["head.turn"] = t["head.turn"] + pad(np.sin(2 * math.pi * roll) * WAKE_ROLL_TURN * env)
+        for h, phase in (("hand_l", 0.0), ("hand_r", 0.35)):
+            if f"{h}.r" in t:
+                r = _span(u, 0.50 + phase * 0.3, 0.97)
+                e = np.sin(math.pi * r) ** 2
+                t[f"{h}.r"] = t[f"{h}.r"] + pad(HAND_LIFT_SIGN[h] * np.sin(math.pi * r) * WAKE_ROLL_HAND * e)
+        t["body.x"] = t["body.x"] + pad(np.sin(2 * math.pi * roll) * WAKE_ROLL_SWAY * env)
+    else:
+        # a last small drift of the head before it gives out
+        drift = np.sin(math.pi * _span(u, 0.0, 0.35)) * 3.0
+        t["head.turn"] = t["head.turn"] + np.concatenate([np.zeros(REST), drift, np.zeros(REST)])
+
+    for key in t:
+        part, axis = key.split(".")
+        t[key] = clamp(part, axis, t[key])
+        t[key][:REST] = clamp(part, axis, a[key])
+        t[key][-REST:] = clamp(part, axis, b[key])
+    return t, n
+
+
+def build_tracks(n_active, vol, open_target, cues, rng, accents=()):
     n = n_active + 2 * REST
     act = slice(REST, REST + n_active)
     t = {f"{k}.{a}": np.full(n, float(REST_POSE.get(f"{k}.{a}", 0))) for k, a in channels()}
 
     if vol is not None:
         o = jaw_follow(open_target[:n_active])
+        if len(accents):
+            o = apply_accents(o, accents)
         closed = REST_POSE.get("lower_jaw.y", 0)
         t["lower_jaw.y"][act] = closed + o * (PARTS["lower_jaw"]["down"] * JAW_OPEN - closed)
         t["upper_jaw.y"][act] = -o * PARTS["upper_jaw"]["up"] * UPPER_JAW_OPEN
         sm = np.convolve(lead(vol[:n_active], HEAD_LEAD), np.ones(6) / 6, mode="same")
         t["head.y"][act] = sm * PARTS["head"]["down"] * HEAD_NOD - o * HEAD_JAW_LIFT
+        for a in accents:                       # accents marked "head" also dip the head
+            if isinstance(a, dict) and a.get("head"):
+                dur = float(a.get("dur", 0.3))
+                i0 = max(0, int(round((float(a["t"]) - dur / 2) * FPS)))
+                i1 = min(n_active, int(round((float(a["t"]) + dur * 1.5) * FPS)))
+                if i1 > i0:
+                    bump = np.sin(np.linspace(0, math.pi, i1 - i0)) ** 2
+                    t["head.y"][REST + i0:REST + i1] += bump * ACCENT_HEAD
 
     if vol is not None and GESTURES:
         _add_gestures(t, vol[:n_active], n_active, rng)
@@ -709,7 +847,13 @@ def render(size, draw, tracks, n, audio, out, png_dir=None, fx=None, mane_rig=No
         import os; os.makedirs(png_dir, exist_ok=True)
     cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgba",
            "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-"]
-    if audio: cmd += ["-itsoffset", str(REST / FPS), "-i", audio, "-c:a", "aac"]
+    if audio:
+        cmd += ["-itsoffset", str(REST / FPS), "-i", audio, "-c:a", "aac"]
+    else:
+        # a silent track, so every clip has the same audio layout: switching between
+        # a clip with audio and one without makes the player pause to reconfigure
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-c:a", "aac",
+                "-t", f"{n / FPS:.4f}"]
     cmd += ["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", out]
     ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
@@ -765,6 +909,9 @@ def main():
     ap.add_argument("psd")
     ap.add_argument("--audio")
     ap.add_argument("--cues", help="JSON list of cues")
+    ap.add_argument("--accents",
+                    help="JSON list of syllables to punch up: times, or objects with "
+                         "t / amount / dur / floor / head. Use --report for the times.")
     ap.add_argument("--idle", type=float, metavar="SECONDS", help="render an idle clip with no audio")
     ap.add_argument("--limits-test", action="store_true")
     ap.add_argument("--list", action="store_true")
@@ -776,6 +923,12 @@ def main():
     ap.add_argument("-o", "--out", default="out.mp4")
     ap.add_argument("--png", metavar="DIR", help="also write a lossless PNG frame sequence")
     ap.add_argument("--no-fx", action="store_true", help="skip dust and flicker")
+    ap.add_argument("--pose", help="with --idle: a frozen clip holding this pose (e.g. hunch)")
+    ap.add_argument("--transition", nargs=2, metavar=("FROM", "TO"),
+                    help="a clip moving between two poses, e.g. hunch rest")
+    ap.add_argument("--style", choices=["wake", "sleep"], default=None,
+                    help="how --transition moves; default: wake if it ends on rest")
+    ap.add_argument("--secs", type=float, default=4.0, help="length of a --transition clip")
     a = ap.parse_args()
 
     if a.list:
@@ -795,6 +948,7 @@ def main():
     size, draw, mane_rig = load_psd(a.psd, a.scale)
     rng = np.random.default_rng(a.seed)
     cues = json.load(open(a.cues)) if a.cues else []
+    accents = json.load(open(a.accents)) if a.accents else []
 
     if a.limits_test:
         tracks, n = limits_test_tracks()
@@ -802,11 +956,17 @@ def main():
         if a.out == "out.mp4": a.out = "limits_test.mp4"
     elif a.audio:
         vol, target = audio_features(a.audio)
-        tracks, n = build_tracks(len(vol), vol, target, cues, rng)
+        tracks, n = build_tracks(len(vol), vol, target, cues, rng, accents)
+    elif a.transition:
+        style = a.style or ("wake" if a.transition[1] == "rest" else "sleep")
+        tracks, n = build_transition(a.transition[0], a.transition[1], a.secs, style, rng)
+    elif a.idle and a.pose:
+        tracks, n = build_pose_tracks(a.pose, a.idle)
+        mane_rig, a.no_fx = None, True          # frozen: no mane drift, no dust
     elif a.idle:
         tracks, n = build_tracks(int(a.idle * FPS), None, None, cues, rng)
     else:
-        sys.exit("Give --audio, --idle SECONDS, --limits-test, or --list.")
+        sys.exit("Give --audio, --idle SECONDS, --transition FROM TO, --limits-test, or --list.")
     fx = None if (a.limits_test or a.no_fx) else make_fx(n, size, np.random.default_rng(a.seed + 1000))
     render(size, draw, tracks, n, a.audio, a.out, a.png, fx, mane_rig)
 
