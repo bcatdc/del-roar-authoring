@@ -1,0 +1,15 @@
+*.psd
+*.mp4
+*.wav
+*.mp3
+clips*/
+cuts/
+audio*/
+frames/
+*_rest.png
+preview*.mp4
+render.log
+show_plan.json
+labels.txt
+__pycache__/
+*.pyc

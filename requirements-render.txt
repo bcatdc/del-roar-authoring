@@ -1,0 +1,5 @@
+# Rendering clips from the PSD, on the tower. Not needed on the NUC.
+numpy>=1.26
+pillow>=10.0
+psd-tools>=1.9
+opencv-python>=4.9
